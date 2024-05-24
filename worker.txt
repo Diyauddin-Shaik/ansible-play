@@ -1,0 +1,8 @@
+worker.yml
+ 
+---
+- hosts: worker
+  become: yes
+  tasks:
+    - name: Join the cluster
+      command: kubeadm join --token <TOKEN> <MASTER_IP>:6443 --discovery-token-ca-cert-hash sha256:<HASH>
