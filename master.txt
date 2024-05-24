@@ -1,0 +1,65 @@
+---
+- hosts: master
+  become: yes
+  tasks:
+    - name: ports disable
+      shell: |
+        # ports= " 10250 10255 10257 10259 10251 10252 2380 2379 6443 "
+        #for port in "${ports[@]}"; do
+        for port in 6443 10250 10259 10257 2379 2380; do
+          fuser -k ${port}/tcp || true
+        done
+      args:
+        executable: /bin/bash
+
+
+    - name: reset previous kubeadm
+      command: kubeadm reset -f
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_init_output
+     
+    - name: Create .kube directory
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Copy admin.conf to user's kube config
+      command: >
+        cp /etc/kubernetes/admin.conf /home/{{ ansible_user }}/.kube/config
+
+    - name: Change permissions for kube config
+      file:
+        path: /home/{{ ansible_user }}/.kube/config
+        state: file
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+
+    - name: set kubeconfig env
+      shell: echo 'export KUBECONFIG=/home/{{ansible_user }}/.kube/config' >> /home/{{ansible_user }}/.bashrc
+
+    - name: Wait for the Kubernetes API server to be ready
+      shell: |
+        export KUBECONFIG=/home/{{ansible_user }}/.kube/config
+        for i in {1..10}; do
+          if kubectl get nodes; then
+            break
+          else
+            sleep 10
+          fi
+        done
+      environment:
+        # KUBECONFIG: export KUBECONFIG=/home/{{ansible_user }}/.kube/config
+        KUBECONFIG: /home/{{ansible_user }}/.kube/config
+      args:
+        executable: /bin/bash
+
+    - name: Install Flannel CNI
+      command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment :
+        KUBECONFIG : /etc/kubernetes/admin.conf
