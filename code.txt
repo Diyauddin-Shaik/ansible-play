@@ -1,0 +1,190 @@
+---
+- hosts: all
+  become: yes
+  tasks:
+    - name: Install required packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - software-properties-common
+          - gnupg2
+        state: present
+        
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker APT repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+        state: present
+      notify:
+        - Import Docker GPG key
+
+    - name: Install Docker
+      apt:
+        name: docker-ce
+        state: present
+
+    - name: Add Kubernetes GPG key
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+
+    - name: Add Kubernetes APT key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+        mode: '0644'
+        force: true
+          #        state: present
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /" 
+        state: present
+      
+
+    - name: Install Kubernetes packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+          - kubelet
+          - kubeadm
+          - kubectl
+
+    - name: Hold Kubernetes packages
+      apt:
+        name: "{{ packages }}"
+        state: present
+          #state: held
+      vars:
+        packages:
+          - kubelet
+          - kubeadm
+          - kubectl
+          
+
+    - name: Disable swap
+      command: swapoff -a
+
+    - name: Ensure swap is disabled on reboot
+      replace:
+        path: /etc/fstab
+        regexp: '^(.*\sswap\s.*)$'
+        replace: '# \1'
+
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+ 
+    - name: Configure containerd
+      copy:
+        content: |
+          [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+            SystemdCgroup = true
+        dest: /etc/containerd/config.toml
+ 
+    - name: Restart containerd
+      service:
+        name: containerd
+        state: restarted
+        enabled: yes        
+
+- hosts: master
+  become: yes
+  tasks:
+    - name: ports disable
+      shell: |
+        ports=" 10250 10255 10257 10259 10251 10252 2380 2379 6443"
+        for port in "${ports[@]}"; do
+          fuser -k ${port}/tcp || true
+        done
+      args:
+        executable: /bin/bash
+
+
+    - name: reset previous kubeadm
+      command: kubeadm reset -f
+
+    - name: Initialize Kubernetes master
+      # shell: |
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      register: kubeadm_init
+      args:
+        creates: /etc/kubernetes/admin.conf
+       # update_cache: yes
+
+    - name: Create .kube directory
+      file:
+        path: /home/{{ansible_user }}/.kube
+        state: directory
+        mode: '0755'
+        owner: "{{ansible_user }}"
+        group: "{{ansible_user }}"
+
+    - name: Copy admin.conf to .kube/config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ansible_user }}"
+        group: "{{ansible_user }}"
+        mode: '0644'
+
+    - name: set kubeconfig env
+      shell: echo 'export KUBECONFIG=/home/{{ansible_user }}/.kube/config' >> /home/{{ansible_user }}/.bashrc
+
+    - name: Wait for the Kubernetes API server to be ready
+      shell: |
+        export KUBECONFIG=/home/{{ansible_user }}/.kube/config
+        for i in {1..10}; do
+          if kubectl get nodes; then
+            break
+          else
+            sleep 10
+          fi
+        done
+      environment:
+        KUBECONFIG: export KUBECONFIG=/home/{{ansible_user }}/.kube/config
+      args:
+        executable: /bin/bash
+
+    - name: Install Pod network (Flannel)
+      command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Save join command to a file
+      #shell: kubeadm token create --print-join-commond > /root/kubeadm_join_cmd.sh
+      # register: join_command
+      copy:
+        content: "{{ kubeadm_init.stdout_lines | select('search', 'kubeadm join') | list | join('\n') }}"
+        dest: /home/{{ ansible_user }}/kubeadm_join_cmd.sh
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+- hosts: worker
+  become: yes
+  tasks:
+    - name: Copy join command from master
+      fetch:
+        src: /root/kubeadm_join_cmd.sh
+        dest: /tmp/kubeadm_join_cmd.sh
+        flat: yes
+      delegate_to: master
+
+    - name: Join the Kubernetes cluster
+      shell: sh /tmp/kubeadm_join_cmd.sh
